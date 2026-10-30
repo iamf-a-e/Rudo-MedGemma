@@ -19,6 +19,7 @@ from training import products, instructions, pregnancy_data, pregnancy_data_shon
 from products_data import products_by_category
 from upstash_redis import Redis
 from medgemma_client import ask_medgemma, medgemma_enabled, pairs_from_history
+from medgemma_guardrails import clean_model_output, compose_reply
 import json
 import re
 import random
@@ -3149,18 +3150,16 @@ def build_conversation_context(sender: str, max_turns: int = 6) -> str:
 
 
 def _try_medgemma(question: str, lang: str, sender: str = None):
-    """Answer with the fine-tuned MedGemma server if MEDGEMMA_URL is set.
-    Returns None (so the caller falls back to Gemini) on any failure or if the reply leaks English."""
+    """Answer with the fine-tuned MedGemma server if MEDGEMMA_URL is set, wrapped in safety guardrails
+    (danger-sign referral first, safety footer, output cleaning). Returns None to fall back to Gemini."""
     if not medgemma_enabled():
         return None
     history = pairs_from_history(get_user_conversation(sender)) if sender else []
-    text = ask_medgemma(question, history=history)
-    if not text:
-        return None
-    if looks_like_english_leak(text, lang):
-        logging.warning(f"[medgemma] English leak for lang={lang}, falling back to Gemini")
-        return None
-    return text
+    text = clean_model_output(ask_medgemma(question, history=history))
+    if text and looks_like_english_leak(text, lang):
+        logging.warning(f"[medgemma] English leak for lang={lang}, discarding model answer")
+        text = None
+    return compose_reply(question, lang, text)
 
 
 def ask_gemini(question: str, lang: str = "english", sender: str = None) -> str:
