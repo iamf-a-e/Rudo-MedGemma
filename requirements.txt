@@ -1,0 +1,11 @@
+Flask
+google-generativeai
+pymupdf
+sqlalchemy
+urlextract
+psycopg2-binary
+redis
+upstash-redis
+packaging>=23.0
+PyPDF2
+requests
