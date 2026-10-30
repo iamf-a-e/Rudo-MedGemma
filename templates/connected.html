@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp AI Business Assistant</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: #232330;
+            font-family: 'Roboto', sans-serif;
+            color: #fff;
+        }
+
+        .container {
+            background-color: #181820;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.2);
+            text-align: center;
+        }
+
+        h1 {
+            font-size: 3em;
+            margin-bottom: 20px;
+            color: #04d9ff;
+            text-shadow: 0 0 5px #04d9ff;
+        }
+
+        .status-icon {
+            font-size: 6em;
+            color: #04d9ff;
+            margin-bottom: 20px;
+        }
+
+        p {
+            font-size: 1.2em;
+            line-height: 1.6;
+            margin-bottom: 20px;
+        }
+
+        .button {
+            background-color: #04d9ff;
+            color: #fff;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 1.2em;
+            cursor: pointer;
+            transition: background-color 0.3s ease;
+        }
+
+        .button:hover {
+            background-color: #00b0e0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Bot Status</h1>
+        <div class="status-icon">&#9989;</div>
+        <p>Congratulations! Your bot is successfully connected to Vercel.</p>
+        <p>Now copy the deployment link and paste it on the corresponding field in the WhatsApp API configuration page.</p>
+        <a href="https://developers.facebook.com/apps/"><button class="button">Go to WhatsApp API Configuration</button></a>
+    </div>
+</body>
+</html>
