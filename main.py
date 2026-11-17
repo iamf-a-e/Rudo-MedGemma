@@ -18,8 +18,9 @@ Env vars:
     WA_TOKEN, PHONE_ID, OWNER_PHONE, VERIFY_TOKEN (default "BOT")
     UPSTASH_REDIS_URL, UPSTASH_REDIS_TOKEN
     GEN_API                       Gemini key (language detection only)
-    MEDGEMMA_URL                  read by medgemma_client.py
-    TRANSLATEGEMMA_URL            read by translategemma_client.py
+    MEDGEMMA_URL, MEDGEMMA_TOKEN, MEDGEMMA_TIMEOUT      read by medgemma_client.py
+    TRANSLATEGEMMA_URL, TRANSLATEGEMMA_TOKEN,
+    TRANSLATEGEMMA_TIMEOUT        read by translategemma_client.py
     TRANSLATE_LANGS               optional, languages to pivot through English
 """
 
@@ -1313,12 +1314,11 @@ def _retry(fn, attempts=2):
 def _history_for_model(sender):
     """
     Stored history shaped for pairs_from_history, preferring the English version of each turn.
-    The current user message is already stored by the webhook, so it is dropped here and
-    passed to ask_medgemma separately. Adjust if your ask_medgemma expects it in history.
+    The current user message is already the newest stored entry, and pairs_from_history drops
+    the newest entry itself, so it must stay in the list here. Thinking messages are stored
+    with save=False so nothing is appended after the user message.
     """
     history = get_user_conversation(sender)
-    if history and history[-1].get("role") == "user":
-        history = history[:-1]
     history = history[-HISTORY_ENTRIES_FOR_MODEL:]
     out = []
     for entry in history:
