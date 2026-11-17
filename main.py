@@ -14,6 +14,14 @@ Flow for every text message:
 
 Gemini is used ONLY for language detection. Replies never come from Gemini.
 
+History rules (these keep MedGemma answering in English):
+    * Fixed UI text (welcome, greetings, resets, agent hand-offs, failure messages) is sent with
+      save=False, so it never enters the conversation history.
+    * For pivoted languages only turns that have an English version (message_en) are passed to
+      MedGemma. Local-language text never reaches the model.
+    * The model reply is checked to be English before it is translated back. One retry without
+      history, then the user gets the failure message instead of garbled medical advice.
+
 Env vars:
     WA_TOKEN, PHONE_ID, OWNER_PHONE, VERIFY_TOKEN (default "BOT")
     UPSTASH_REDIS_URL, UPSTASH_REDIS_TOKEN
@@ -273,7 +281,9 @@ def send(answer, sender, phone_id_val, message_en=None, save=True):
     """
     Send a WhatsApp text message.
     message_en: English version of the reply, stored with the history for MedGemma context.
-    save=False for messages that should not enter the conversation history.
+    save=False for messages that should not enter the conversation history. Use it for every
+    fixed UI text (welcome, greetings, resets, agent hand-offs, failures): history is what
+    MedGemma sees, and local-language boilerplate in it makes the model answer in that language.
     """
     url = f"https://graph.facebook.com/v19.0/{phone_id_val}/messages"
     headers = {
@@ -408,20 +418,21 @@ def notify_agents_of_request(sender, current_phone_id):
 def handle_agent_accept(agent_phone, user_number, current_phone_id):
     """Called when an agent taps Accept."""
     if not redis_client:
-        send("Sorry, the agent system is unavailable right now.", user_number, current_phone_id)
+        send("Sorry, the agent system is unavailable right now.", user_number, current_phone_id, save=False)
         return
 
     try:
         raw = redis_client.get(_agent_request_key(user_number))
         if not raw:
             send("⚠️ This chat request has already expired or been accepted by another agent.",
-                 agent_phone, current_phone_id)
+                 agent_phone, current_phone_id, save=False)
             return
 
         request_data = json.loads(raw) if isinstance(raw, str) else raw
 
         if request_data.get("status") != "pending":
-            send("⚠️ This chat has already been accepted by another agent.", agent_phone, current_phone_id)
+            send("⚠️ This chat has already been accepted by another agent.", agent_phone, current_phone_id,
+                 save=False)
             return
 
         request_data["status"] = "accepted"
@@ -448,19 +459,19 @@ def handle_agent_accept(agent_phone, user_number, current_phone_id):
             f"✅ You are now connected to the user ({user_number}).\n"
             f"Their messages will be forwarded to you. Reply here to send messages to them.\n"
             f"Type *END CHAT* to end the session.",
-            agent_phone, current_phone_id
+            agent_phone, current_phone_id, save=False
         )
         send(
             f"✅ Great news! {agent_name} has accepted your chat request.\n"
             f"You are now connected!",
-            user_number, current_phone_id
+            user_number, current_phone_id, save=False
         )
 
         for other_name, other_phone in AGENTS.items():
             if other_phone != agent_phone:
                 send(
                     f"ℹ️ The chat request from user {user_number} has been accepted by {agent_name}.",
-                    other_phone, current_phone_id
+                    other_phone, current_phone_id, save=False
                 )
 
     except Exception as e:
@@ -475,12 +486,12 @@ def handle_agent_reject(agent_phone, user_number, current_phone_id):
     try:
         raw = redis_client.get(_agent_request_key(user_number))
         if not raw:
-            send("⚠️ This chat request has already expired.", agent_phone, current_phone_id)
+            send("⚠️ This chat request has already expired.", agent_phone, current_phone_id, save=False)
             return
 
         request_data = json.loads(raw) if isinstance(raw, str) else raw
         if request_data.get("status") != "pending":
-            send("ℹ️ This request was already handled.", agent_phone, current_phone_id)
+            send("ℹ️ This request was already handled.", agent_phone, current_phone_id, save=False)
             return
 
         rejections_raw = redis_client.get(_agent_rejections_key(user_number))
@@ -492,7 +503,7 @@ def handle_agent_reject(agent_phone, user_number, current_phone_id):
             rejections.append(agent_phone)
         redis_client.set(_agent_rejections_key(user_number), json.dumps(rejections), ex=AGENT_TIMEOUT_SECONDS + 10)
 
-        send("👍 You have rejected this chat request.", agent_phone, current_phone_id)
+        send("👍 You have rejected this chat request.", agent_phone, current_phone_id, save=False)
 
         if set(rejections) >= set(AGENTS.values()):
             _handle_no_agents_available(user_number, current_phone_id)
@@ -554,7 +565,7 @@ def _handle_no_agents_available(user_number, current_phone_id):
             "You have been handed back to Rudo, our virtual assistant.\n"
             "Is there anything else I can help you with?"
         )),
-        user_number, current_phone_id
+        user_number, current_phone_id, save=False
     )
 
 
@@ -570,7 +581,7 @@ def relay_user_message_to_agent(sender, prompt, current_phone_id) -> bool:
         agent_phone = session.get("agent_phone")
         if not agent_phone:
             return False
-        send(f"💬 *User ({sender}):* {prompt}", agent_phone, current_phone_id)
+        send(f"💬 *User ({sender}):* {prompt}", agent_phone, current_phone_id, save=False)
         return True
     except Exception as e:
         logging.error(f"Error relaying user message to agent: {e}")
@@ -607,7 +618,7 @@ def relay_agent_message_to_user(agent_phone, prompt, current_phone_id) -> bool:
             user_states[user_number].pop("agent_phone", None)
             save_single_user_state(user_number)
 
-            send("✅ You have ended the chat session.", agent_phone, current_phone_id)
+            send("✅ You have ended the chat session.", agent_phone, current_phone_id, save=False)
             lang = user_states[user_number].get("language", "english")
             end_map = {
                 "shona": (
@@ -647,11 +658,11 @@ def relay_agent_message_to_user(agent_phone, prompt, current_phone_id) -> bool:
                     "You have been returned to Rudo, our virtual assistant.\n"
                     "Is there anything else I can help you with?"
                 )),
-                user_number, current_phone_id
+                user_number, current_phone_id, save=False
             )
             return True
 
-        send(f"💬 *Agent:* {prompt_stripped}", user_number, current_phone_id)
+        send(f"💬 *Agent:* {prompt_stripped}", user_number, current_phone_id, save=False)
         return True
 
     except Exception as e:
@@ -1171,6 +1182,7 @@ ENGLISH_TELLS = {
 
 
 def looks_like_english_leak(text: str, lang: str) -> bool:
+    """Output check for the local-language reply: too much English means the translation failed."""
     if lang == "english" or not text:
         return False
     words = re.findall(r"[a-zA-Z']+", text.lower())
@@ -1178,6 +1190,29 @@ def looks_like_english_leak(text: str, lang: str) -> bool:
         return False
     hits = sum(1 for w in words if w in ENGLISH_TELLS)
     return (hits / len(words)) > 0.15
+
+
+# Extra everyday English words, so list style medical replies ("- Missed period, nausea, ...")
+# are not mistaken for non-English text.
+_ENGLISH_CHECK_WORDS = ENGLISH_TELLS | {
+    "of", "to", "in", "for", "if", "or", "it", "be", "may", "also", "from", "not", "but",
+    "pregnancy", "pregnant", "baby", "clinic", "test", "period", "symptoms", "include",
+}
+_ENGLISH_MIN_RATIO = 0.08
+
+
+def looks_english(text: str) -> bool:
+    """
+    Inverse of looks_like_english_leak: True when `text` reads as English.
+    Short text is given the benefit of the doubt. Used on the MedGemma reply before it is
+    translated, because garbled local-language output from the model would otherwise be
+    'translated' into something even further from the truth.
+    """
+    words = re.findall(r"[a-zA-Z']+", (text or "").lower())
+    if len(words) < 6:
+        return True
+    hits = sum(1 for w in words if w in _ENGLISH_CHECK_WORDS)
+    return (hits / len(words)) >= _ENGLISH_MIN_RATIO
 
 
 # ─────────────────────────────────────────────
@@ -1212,7 +1247,8 @@ def send_welcome_with_id(sender, phone_id_val, lang, user_id):
             f"Hello! I'm Rudo, Dawa Health's virtual assistant. Your ID is: {user_id}. "
             f"Keep this ID safe because it'll be asked for at the Dawa clinics. How can I help you today?"
         ),
-        sender, phone_id_val
+        sender, phone_id_val,
+        save=False,   # fixed text, must not reach MedGemma through the history
     )
 
 
@@ -1311,19 +1347,27 @@ def _retry(fn, attempts=2):
     raise last
 
 
-def _history_for_model(sender):
+def _history_for_model(sender, lang):
     """
-    Stored history shaped for pairs_from_history, preferring the English version of each turn.
-    The current user message is already the newest stored entry, and pairs_from_history drops
-    the newest entry itself, so it must stay in the list here. Thinking messages are stored
-    with save=False so nothing is appended after the user message.
+    Stored history shaped for pairs_from_history.
+
+    * The newest stored entry is the current user message. It is dropped here, and a blank
+      sentinel entry is appended because pairs_from_history always drops the last entry.
+      The current question is passed to the model separately.
+    * For pivoted languages only entries that have an English version (message_en) are kept.
+      Local-language text must never reach MedGemma: with a weak grasp of these languages it
+      starts answering in broken Shona/Ndebele/etc. instead of English.
+    * English users have no pivot, so their plain message text is used.
     """
-    history = get_user_conversation(sender)
-    history = history[-HISTORY_ENTRIES_FOR_MODEL:]
+    history = get_user_conversation(sender)[-HISTORY_ENTRIES_FOR_MODEL:]
     out = []
-    for entry in history:
-        text = entry.get("message_en") or entry.get("message", "")
-        out.append({**entry, "message": text})
+    for entry in history[:-1]:
+        text = entry.get("message_en")
+        if not text and lang == "english":
+            text = entry.get("message", "")
+        if text and text.strip():
+            out.append({**entry, "message": text})
+    out.append({"role": "user", "message": ""})   # sentinel, dropped by pairs_from_history
     return out
 
 
@@ -1351,8 +1395,21 @@ def generate_reply(sender, prompt, lang):
             raise RuntimeError("MedGemma is not configured")
 
         model_question = q_en if pivot else prompt
-        history = pairs_from_history(_history_for_model(sender))
+        history = pairs_from_history(_history_for_model(sender, lang))
+        logging.info(f"[pipeline] history_to_model={history!r}")
         reply_en = clean_model_output(ask_medgemma(model_question, history=history))
+
+        # The model must answer in English. If it did not, retry once with no history,
+        # and if that fails too, drop the reply so the user gets the failure message
+        # instead of garbled medical advice.
+        if pivot and reply_en and not looks_english(reply_en):
+            logging.warning(
+                f"[generate_reply] MedGemma reply is not English, retrying without history: {reply_en!r}"
+            )
+            reply_en = clean_model_output(ask_medgemma(model_question, history=[]))
+            if reply_en and not looks_english(reply_en):
+                logging.error(f"[generate_reply] retry also not English, discarding: {reply_en!r}")
+                reply_en = None
 
         if reply_en:
             if pivot:
@@ -1366,7 +1423,7 @@ def generate_reply(sender, prompt, lang):
     except Exception as e:
         logging.error(f"[generate_reply] {type(e).__name__}: {e}", exc_info=True)
 
-    logging.info(f"[pipeline] prompt={prompt!r} q_en={q_en!r} reply_en={reply_en!r} local={local_text!r}")   
+    logging.info(f"[pipeline] prompt={prompt!r} q_en={q_en!r} reply_en={reply_en!r} local={local_text!r}")
 
     # Guardrails get the original wording and, when we have it, the English translation,
     # so danger sign checks work whichever language the keywords live in.
@@ -1385,11 +1442,13 @@ def answer_user(sender, prompt, phone_id_val):
         send(THINKING_MAP.get(lang, "Let me think..."), sender, phone_id_val, save=False)
 
     reply, reply_en = generate_reply(sender, prompt, lang)
-    if not reply:
+    failed = not reply
+    if failed:
         reply = failure_message(lang)
         reply_en = None
 
-    send(reply, sender, phone_id_val, message_en=reply_en)
+    # A failure message is fixed local text, so keep it out of the history.
+    send(reply, sender, phone_id_val, message_en=reply_en, save=not failed)
 
 
 # ─────────────────────────────────────────────
@@ -1460,7 +1519,7 @@ def handle_message(sender, prompt, phone_id_val):
             save_single_user_state(sender)
             lang = state.get("language", "english")
             send(BACK_MAP.get(lang, "Your agent session has ended. Returning you to Rudo. How can I help?"),
-                 sender, phone_id_val)
+                 sender, phone_id_val, save=False)
         return
 
     if step == "waiting_for_agent":
@@ -1475,7 +1534,7 @@ def handle_message(sender, prompt, phone_id_val):
             save_single_user_state(sender)
             lang = state.get("language", "english")
             send(CANCEL_MAP.get(lang, "Your request has been cancelled. Returning you to Rudo."),
-                 sender, phone_id_val)
+                 sender, phone_id_val, save=False)
         else:
             check_agent_request_timeout(sender, phone_id_val)
         return
@@ -1496,7 +1555,7 @@ def handle_message(sender, prompt, phone_id_val):
     # 3. Ask for a human
     if is_human_agent_request(prompt):
         send(CONNECTING_MAP.get(lang, "🔍 Looking for a human agent to assist you...\nPlease wait.\n"),
-             sender, phone_id_val)
+             sender, phone_id_val, save=False)
         state["step"] = "waiting_for_agent"
         save_single_user_state(sender)
         notify_agents_of_request(sender, phone_id_val)
@@ -1505,12 +1564,12 @@ def handle_message(sender, prompt, phone_id_val):
     # 4. Reset conversation context
     if is_reset_request(prompt):
         clear_conversation(sender)
-        send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val)
+        send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val, save=False)
         return
 
     # 5. Plain greeting, no model call needed
     if is_greeting_only(prompt) or is_referral_greeting(prompt):
-        send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val)
+        send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val, save=False)
         return
 
     # 6. Everything else is a free-form question
@@ -1592,7 +1651,7 @@ def _process_message(message, value):
         ensure_user_state(sender, refresh=True)
         lang = user_states.get(sender, {}).get("language", "english")
         send(NON_TEXT_MAP.get(lang, "Sorry, I can only process text messages. Please send a text message."),
-             sender, incoming_phone_id)
+             sender, incoming_phone_id, save=False)
         return
 
     prompt = message["text"]["body"]
