@@ -1,6 +1,6 @@
 """
 db.py
-
+ 
 Supabase storage for the Rudo bot. It talks to Supabase's REST API (PostgREST) with plain
 `requests`, so there is no extra SDK to install and cold starts on Vercel stay light.
 
