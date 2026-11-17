@@ -86,7 +86,7 @@ Details that matter when you reproduce or retrain:
 - The adapter was trained single-turn, so the bot sends at most the last two question and answer pairs as context.
 - Training used Gemma's turn format with the system text folded into the first user turn. Inference must use the same format, or the adapter behaves like the base model.
 - Inference is greedy (no sampling) with a repetition penalty of 1.1 and a cap of a few hundred new tokens, to keep WhatsApp replies short and stable.
-- The adapter is published as [tarirozw/medgemma-maternal-lora-v2](https://huggingface.co/tarirozw/medgemma-maternal-lora-v2). Training data sources, size and the training notebook are summarised here: [TRAINING_DATA_SUMMARY](https://huggingface.co/tarirozw).
+- The adapter is published as [dawahealth/medgemma-maternal-lora-v2](https://huggingface.co/dawahealth/medgemma-maternal-lora-v2). Training data sources, size and the training notebook are summarised here: [TRAINING_DATA_SUMMARY](https://huggingface.co/dawahealth).
 
 ### 2. A translation pivot for languages the model is weak in
 
@@ -178,7 +178,7 @@ Set these in each Space under Settings, Variables and secrets:
 |---|---|---|
 | `HF_TOKEN` | both | Hugging Face token with read access, from an account that accepted the model terms. Without it the download fails with a 401 gated repo error |
 | `MEDGEMMA_TOKEN` | MedGemma | Bearer token the bot must send |
-| `ADAPTER` | MedGemma | Adapter repo, for example `tarirozw/medgemma-maternal-lora-v2` |
+| `ADAPTER` | MedGemma | Adapter repo, for example `dawahealth/medgemma-maternal-lora-v2` |
 | `TRANSLATEGEMMA_TOKEN` | TranslateGemma | Bearer token the bot must send |
 
 Notes for running them:
