@@ -75,7 +75,7 @@ The bot is a Flask app deployed on Vercel. It has no GPU, so the language models
 
 ## How the AI agent was built
 
-Rudo started as a menu driven bot on a general purpose LLM and was rebuilt around a fine-tuned medical model. The main design decisions, and why they were made:
+Rudo was rebuilt around a fine-tuned medical model. The main design decisions, and why they were made:
 
 ### 1. A small fine-tuned medical model instead of a general chatbot
 
