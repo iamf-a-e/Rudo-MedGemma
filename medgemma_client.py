@@ -1,12 +1,4 @@
-"""Tiny client the Rudo bot uses to call the MedGemma Gradio Space. Never raises: returns None on any
-failure so the caller can show its fallback message.
 
-Env vars:
-    MEDGEMMA_URL      https://iamfae-medgemmav2.hf.space   (base URL only, no /answer)
-    MEDGEMMA_TOKEN    same value as the MEDGEMMA_TOKEN secret on the Space
-    MEDGEMMA_TIMEOUT  seconds to wait for the answer (default 90, ZeroGPU cold starts are slow)
-    HF_TOKEN          optional, only needed if the Space is private
-"""
 import json
 import logging
 import os
