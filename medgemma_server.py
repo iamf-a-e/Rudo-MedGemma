@@ -1,14 +1,4 @@
-"""GPU inference server for the fine-tuned MedGemma maternal model.
 
-Run this on a machine with a GPU (Colab T4 for a demo, RunPod / Modal / a VM for real use).
-The Rudo WhatsApp bot (Flask on Vercel) calls POST /answer over HTTPS.
-
-    pip install -q unsloth flask
-    export HF_TOKEN=hf_xxx                 # read token, MedGemma terms accepted
-    export MEDGEMMA_TOKEN=some-long-secret # the bot sends this as a Bearer token
-    export ADAPTER=tarirozw/medgemma-maternal-lora   # or a local path
-    python medgemma_server.py
-"""
 import os
 import threading
 
