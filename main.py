@@ -10,13 +10,18 @@ Flow for every text message:
            guardrails (compose_reply) run on the result
            TranslateGemma (English -> user language)
        English goes straight to MedGemma.
-    4. Reply is sent. There are no menus, every message is free-form chat.
+    4. Reply is sent, followed by "Is there anything else I can help you with?".
+         * "no"  -> Rudo offers the product shop (categories, quantity, address, order saved to Redis)
+         * "yes" -> Rudo asks for the question
+         * anything else is treated as a new question and goes straight to MedGemma
+       There are no menus. Every message outside the short follow-up / shop steps is free-form chat.
 
 Gemini is used ONLY for language detection. Replies never come from Gemini.
 
 History rules (these keep MedGemma answering in English):
-    * Fixed UI text (welcome, greetings, resets, agent hand-offs, failure messages) is sent with
-      save=False, so it never enters the conversation history.
+    * Fixed UI text (welcome, greetings, resets, agent hand-offs, follow-up and shop messages,
+      failure messages) is sent with save=False, so it never enters the conversation history.
+    * Shop replies and bare yes/no answers are not kept in the history either.
     * For pivoted languages only turns that have an English version (message_en) are passed to
       MedGemma. Local-language text never reaches the model.
     * The model reply is checked to be English before it is translated back. One retry without
@@ -47,6 +52,7 @@ from upstash_redis import Redis
 
 from medgemma_client import ask_medgemma, medgemma_enabled, pairs_from_history
 from medgemma_guardrails import clean_model_output, compose_reply
+from products_data import products_by_category
 from translategemma_client import needs_translation, translate, translategemma_enabled
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -253,6 +259,19 @@ def clear_conversation(sender):
             logging.error(f"Error clearing conversation: {e}")
 
 
+def drop_last_user_message(sender):
+    """Remove a bare yes/no from the history so MedGemma never sees it."""
+    if not redis_client:
+        return
+    try:
+        conv = get_user_conversation(sender)
+        if conv and conv[-1].get("role") == "user":
+            conv.pop()
+            redis_client.set(f"conversation:{sender}", json.dumps(conv))
+    except Exception as e:
+        logging.error(f"Error dropping last user message: {e}")
+
+
 # ─────────────────────────────────────────────
 #  SENDING
 # ─────────────────────────────────────────────
@@ -307,6 +326,11 @@ def send(answer, sender, phone_id_val, message_en=None, save=True):
     if save and normalize_phone(sender) not in AGENT_PHONES_NORM:
         save_user_conversation(sender, "bot", answer, message_en)
     return response
+
+
+def say(text, sender, phone_id_val):
+    """Fixed UI text: never stored in the conversation history."""
+    return send(text, sender, phone_id_val, save=False)
 
 
 def send_interactive_buttons(phone_number, body_text, buttons, phone_id_val):
@@ -1450,6 +1474,526 @@ def answer_user(sender, prompt, phone_id_val):
     # A failure message is fixed local text, so keep it out of the history.
     send(reply, sender, phone_id_val, message_en=reply_en, save=not failed)
 
+    if failed:
+        user_states[sender]["step"] = "chat"
+        save_single_user_state(sender)
+    else:
+        ask_follow_up_question(sender, phone_id_val)   # "Is there anything else I can help you with?"
+
+
+# ─────────────────────────────────────────────
+#  FOLLOW-UP QUESTION + SHOP FLOW
+#  Stateful only for these short steps. Everything else stays free-form chat.
+#  All text here is fixed UI text, so it is sent with save=False.
+# ─────────────────────────────────────────────
+
+SHOP_STEPS = {
+    "shop_interest", "shop_browse", "shop_order_decision", "shop_product_name",
+    "shop_more_categories", "shop_quantity", "shop_add_more", "shop_address",
+}
+# Steps where a long message is most likely a new medical question, not a shop answer
+SHOP_ESCAPABLE = {"shop_interest", "shop_order_decision", "shop_more_categories", "shop_add_more"}
+
+YES_RESPONSES = ["yes", "yeah", "yep", "please", "ehe", "hongu", "ndizvo", "inde", "yebo", "emukwayi"]
+NO_RESPONSES = ["no", "nah", "nope", "hapana", "kwete", "aiwa", "a'a", "not really", "cha", "ayi",
+                "awe", "iyo", "pe", "that's all", "that is all", "no thanks", "no thank you"]
+
+SHORT_REPLY_MAX_WORDS = 4
+
+
+def _is_short(prompt):
+    return len(prompt.split()) <= SHORT_REPLY_MAX_WORDS
+
+
+def is_yes(prompt):
+    p = prompt.lower().strip()
+    return _is_short(p) and _contains_signal(p, YES_RESPONSES)
+
+
+def is_no(prompt):
+    p = prompt.lower().strip()
+    return _is_short(p) and _contains_signal(p, NO_RESPONSES)
+
+
+def looks_like_new_question(prompt):
+    return "?" in prompt or len(prompt.split()) >= 5
+
+
+def skip_language_update(step, prompt):
+    """Short yes/no/number/address replies in these steps are not a language signal."""
+    if step in SHOP_STEPS:
+        return True
+    return step == "follow_up" and len(prompt.split()) <= 2
+
+
+def reset_flow(sender):
+    """Back to plain chat. Clears any half-finished shop order."""
+    state = user_states[sender]
+    state["step"] = "chat"
+    for k in ("cart", "shop_selected_product", "shop_selected_price", "shop_category"):
+        state.pop(k, None)
+    save_single_user_state(sender)
+
+
+def _all_products():
+    return [p for items in products_by_category.values() for p in items]
+
+
+def _match_product(prompt_lower):
+    if len(prompt_lower) < 3:
+        return None
+    return next(
+        (p for p in _all_products()
+         if p["name"].lower() in prompt_lower or prompt_lower in p["name"].lower()),
+        None,
+    )
+
+
+def _select_product(sender, phone_id_val, lang, product):
+    state = user_states[sender]
+    state["shop_selected_product"] = product["name"]
+    state["shop_selected_price"] = product["price"]
+    _ask_quantity(sender, phone_id_val, lang, product["name"])
+
+
+# ── "Anything else?" ─────────────────────────
+
+FOLLOWUP_MAP = {
+    "shona": "Pane chimwe chandingakubatsira nacho here?",
+    "ndebele": "Ingabe kukhona okunye engingakusiza ngakho?",
+    "tonga": "Hena muli amubuyo umbi?",
+    "chinyanja": "Kodi pali zina zomwe ndingakuthandizireni?",
+    "bemba": "Kuli fintu fimbi ifyo ningamwafwilisha?",
+    "lozi": "Ki sina sika ni ka thusa ka sona",
+}
+
+ASK_QUESTION_MAP = {
+    "shona": "Bvunzai mubvunzo wenyu.",
+    "ndebele": "Ngiyacela ubuze umbuzo wakho.",
+    "tonga": "Amubuye mubuyo",
+    "chinyanja": "Chonde funsani funso lanu.",
+    "bemba": "Nomba, ipusha ilipusho lyobe.",
+    "lozi": "Nkumbira ubuze mubvuzo wako.",
+}
+
+
+def ask_follow_up_question(sender, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+    say(FOLLOWUP_MAP.get(lang, "Is there anything else I can help you with?"), sender, phone_id_val)
+    state["step"] = "follow_up"
+    save_single_user_state(sender)
+
+
+def handle_follow_up_reply(sender, prompt, phone_id_val):
+    """
+    Returns True if the message was a yes/no answer to "anything else?" and is fully handled.
+    Returns False if it is a new question: step goes back to chat and the caller answers it.
+    """
+    state = user_states[sender]
+    lang = state.get("language", "english")
+
+    if is_no(prompt):
+        drop_last_user_message(sender)
+        _ask_purchase_interest(sender, phone_id_val, lang)
+        return True
+
+    if is_yes(prompt):
+        drop_last_user_message(sender)
+        say(ASK_QUESTION_MAP.get(lang, "Please ask your question."), sender, phone_id_val)
+        state["step"] = "chat"
+        save_single_user_state(sender)
+        return True
+
+    state["step"] = "chat"
+    save_single_user_state(sender)
+    return False
+
+
+# ── Purchase interest ────────────────────────
+
+def _ask_purchase_interest(sender, phone_id_val, lang):
+    state = user_states[sender]
+    ask_map = {
+        "shona": "Ungada here kutenga zvimwe zvezvigadzirwa zvedu? ",
+        "ndebele": "Ungathanda ukuthenga noma yimuphi imikhiqizo yethu? ",
+        "chinyanja": "Kodi mukufuna kugula zinthu zina mu zithu zathu? ",
+        "tonga": "Mulakonzya kuyanda kuula zimwi zintu zyesu? ",
+        "bemba": "Bushe kuti mwatemwa ukushita ifipe fyesu fimo? ",
+        "lozi": "Kana u bata ku landa swakupila sa luna? ",
+    }
+    say(ask_map.get(lang, "Would you like to purchase any of our products? We have ultrasound, Birth Kits, HPV Test etc."),
+        sender, phone_id_val)
+    state["step"] = "shop_interest"
+    save_single_user_state(sender)
+
+
+def _interpret_shop_intent(prompt_lower):
+    browse_signals = [
+        "yes", "yeah", "yep", "please", "sure", "ok", "okay", "alright",
+        "ehe", "hongu", "ndizvo", "inde", "yebo",
+        "product", "products", "what do you have", "what have you got",
+        "show me", "available", "categories", "add more", "something else",
+        "buy", "purchase", "looking for",
+        "zvigadzirwa", "zvinhu", "imikhiqizo", "zinthu", "imisansa", "swakupila",
+    ]
+    decline_signals = [
+        "no", "nah", "nope", "not really", "not now", "that's all", "that is all",
+        "done", "finish", "complete", "checkout", "later", "goodbye", "bye",
+        "hapana", "kwete", "aiwa", "a'a", "ayi", "cha",
+    ]
+    if _contains_signal(prompt_lower, browse_signals):
+        return "browse"
+    if _contains_signal(prompt_lower, decline_signals):
+        return "decline"
+    return "unknown"
+
+
+BYE_MAP = {
+    "shona": "Zvakanaka! Iva nezuva rakanaka. Tanga patsva nekuti 'hesi' kana uine mimwe mibvunzo.",
+    "ndebele": "Kulungile! Ube nosuku oluhle. Qala kabusha ngo-'unjani' uma uneminye imibuzo.",
+    "chinyanja": "Zikomo! Khalani ndi tsiku labwino. Yambani ndi 'muli bwanji' ngati muli ndi mafunso.",
+    "tonga": "Kabotu! Mukale kabotu. Amutalike alimwi akulemba kuti 'mwabuka buti' kuti muli amibvunzo imbi.",
+    "bemba": "Chisuma, Mwikale bwino. Lembeni 'shani' nga muli ne nefipusho nafimbi.",
+    "lozi": "Ho lokile! Mube ni lizazi le linde. Qalisa ndi 'mwa bona' ha mu na lipuzo.",
+}
+
+
+def handle_shop_interest(sender, prompt, phone_id_val):
+    lang = user_states[sender].get("language", "english")
+    intent = _interpret_shop_intent(prompt.lower().strip())
+
+    if intent == "decline":
+        say(BYE_MAP.get(lang, "Alright! Have a nice day. Say 'hi' if you have more questions."), sender, phone_id_val)
+        reset_flow(sender)
+    else:
+        _send_shop_categories(sender, phone_id_val, lang)
+
+
+# ── Categories and products ──────────────────
+
+def _send_shop_categories(sender, phone_id_val, lang):
+    header_map = {
+        "shona": "🛒 Makategi eZvigadzirwa:\n",
+        "ndebele": "🛒 Imigqa Yemikhiqizo:\n",
+        "chinyanja": "🛒 Mitundu ya Zinthu:\n",
+        "tonga": "🛒 Misela ya Zintu:\n",
+        "bemba": "🛒 Imisango ya fipe:\n",
+        "lozi": "🛒 Mibeko ya Swakupila:\n",
+    }
+    lines = [header_map.get(lang, "🛒 Product Categories:\n")]
+
+    for idx, (cat_name, items) in enumerate(products_by_category.items(), 1):
+        lines.append(f"*{idx}. {cat_name}*")
+        for item in items[:2]:
+            lines.append(f"   • {item['name']} — {item['price']}")
+        if len(items) > 2:
+            more_map = {
+                "shona": f"   ...uye zvimwe {len(items) - 2}",
+                "ndebele": f"   ...namanye a-{len(items) - 2}",
+                "chinyanja": f"   ...ndi ena {len(items) - 2}",
+                "tonga": f"   ...azimwi {len(items) - 2}",
+                "bemba": f"   ...na fimo {len(items) - 2}",
+                "lozi": f"   ...ni ze ñwi {len(items) - 2}",
+            }
+            lines.append(more_map.get(lang, f"   ...and {len(items) - 2} more"))
+        lines.append("")
+
+    prompt_map = {
+        "shona": "Tumira nhamba yekategi kuti uone zvigadzirwa zvose, kana udza zita rechigadzirwa chaunoda kutenga.",
+        "ndebele": "Thumela inombolo yomugqa ukuze ubone wonke umkhiqizo, noma sitshele igama lomkhiqizo ofuna ukuthenga.",
+        "chinyanja": "Tumizani nambala ya gulu kuti muone zinthu zonse, kapena uzani dzina la chinthu mukufuna kugula.",
+        "tonga": "Tumizya nambala ya musela kuti mubone zintu zyoonse, naa mulembe zina lya cintu ncimuyanda kuuula.",
+        "bemba": "Tuma nambala yafi putulwa pa kutila mumone ifintu fyonse ifilipo, nelyo bikeni ishina lya fintu mulefwaya ukushita.",
+        "lozi": "Lumeza nomolo ya sibaka ku bona swakupila kaufela, kamba u bulele libizo la swakupila u bata ku landa.",
+    }
+    lines.append(prompt_map.get(
+        lang, "Send the category number to see all products, or tell us the name of the product you'd like to order."))
+
+    say("\n".join(lines), sender, phone_id_val)
+    user_states[sender]["step"] = "shop_browse"
+    save_single_user_state(sender)
+
+
+def handle_shop_browse(sender, prompt, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+    prompt_lower = prompt.lower().strip()
+    categories = list(products_by_category.keys())
+
+    if prompt_lower.isdigit():
+        idx = int(prompt_lower) - 1
+        if 0 <= idx < len(categories):
+            cat_name = categories[idx]
+            lines = [f"🏥 *{cat_name}*\n"]
+            for i, item in enumerate(products_by_category[cat_name], 1):
+                lines.append(f"{i}. {item['name']}")
+                lines.append(f"   💰 {item['price']} | 📦 {item['availability']}")
+                lines.append(f"   {item['description']}\n")
+
+            order_map = {
+                "shona": "\nUngada here kuodha chimwe chezvigadzirwa izvi? Pindura 'hongu' uye udza zita rechigadzirwa, kana 'aiwa'.",
+                "ndebele": "\nUngathanda ukuodha noma yimuphi yale mikhiqizo? Phendula 'yebo' ubese usitshele igama lomkhiqizo, noma 'cha'.",
+                "chinyanja": "\nKodi mukufuna kugula chinthu cha zinthu izi? Yankha 'inde' ndipo uzani dzina la chinthu, kapena 'ayi'.",
+                "tonga": "\nSena muyanda kugula cimwi kuzintu eeci? Amupandule kuti 'mbubo' alimwi mulembesye zina lya cintu, naa kuti 'pe'.",
+                "bemba": "\nBushe ulefwaya ukushita fima pali ifi? Yasuka 'ehe,' ulande neshina lyafyo ulefwaya ukushita nangu wasuke ukutila 'awe'.",
+                "lozi": "\nKana u bata ku landa se si liñwi sa swakupila se? Arabela 'inde' u bulele libizo, kamba 'ayi'.",
+            }
+            lines.append(order_map.get(
+                lang, "\nWould you like to order any of these products? Reply 'yes' and tell us the product name, or 'no'."))
+            say("\n".join(lines), sender, phone_id_val)
+            state["step"] = "shop_order_decision"
+            state["shop_category"] = cat_name
+            save_single_user_state(sender)
+        else:
+            invalid_map = {
+                "shona": f"Nhamba isiriyo. Ndapota sarudza pakati pa 1 ne {len(categories)}.",
+                "ndebele": f"Inombolo engavumelekile. Ngicela ukhethe phakathi kuka-1 no-{len(categories)}.",
+                "chinyanja": f"Nambala yolakwika. Chonde sankhani pakati pa 1 ndi {len(categories)}.",
+                "tonga": f"Nambala teyilungeme. Chabota, musale pakati pa 1 a {len(categories)}.",
+                "bemba": f"Napapata, sala nambala pakati pa 1 na {len(categories)}.",
+                "lozi": f"Nomolo e si ya. Ndapota, khetha ku zwana 1 ku ya ku {len(categories)}.",
+            }
+            say(invalid_map.get(lang, f"Invalid number. Please choose between 1 and {len(categories)}."),
+                sender, phone_id_val)
+        return
+
+    matched = _match_product(prompt_lower)
+    if matched:
+        _select_product(sender, phone_id_val, lang, matched)
+        return
+
+    _send_shop_categories(sender, phone_id_val, lang)
+
+
+def handle_shop_order_decision(sender, prompt, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+    prompt_lower = prompt.lower().strip()
+
+    if _contains_signal(prompt_lower, YES_RESPONSES):
+        ask_which_map = {
+            "shona": "Zvakanaka! Nyora zita rechigadzirwa chaunoda kuodha.",
+            "ndebele": "Kulungile! Bhala igama lomkhiqizo ofuna ukuwodha.",
+            "chinyanja": "Chabwino! Lemba dzina la chinthu chomwe mukufuna kugula.",
+            "tonga": "Kabotu! Mulembesye zina lya cintu ncimuyanda kuula.",
+            "bemba": "Chawama! nomba Lemba ishina lya fyo ulefwaya ukushita.",
+            "lozi": "Ho lokile! Ñola libizo la swakupila u bata ku landa.",
+        }
+        say(ask_which_map.get(lang, "Great! Please type the name of the product you'd like to order."),
+            sender, phone_id_val)
+        state["step"] = "shop_product_name"
+        save_single_user_state(sender)
+        return
+
+    if _contains_signal(prompt_lower, NO_RESPONSES):
+        see_more_map = {
+            "shona": "Zvakanaka! Ungada here kuona mamwe makategi? ",
+            "ndebele": "Kulungile! Ungathanda ukubona eminye imigqa? ",
+            "chinyanja": "Chabwino! Kodi mukufuna kuona mitundu ina? ",
+            "tonga": "Kabotu! Mulakonzya kuyanda kubona misela imbi? ",
+            "bemba": "Chisuma! Bushe ulefwaya ukumona ifiputulwa nangu ifipe fimbi? ",
+            "lozi": "Ho lokile! Kana u bata ku bona mibeko ina? ",
+        }
+        say(see_more_map.get(lang, "Alright! Would you like to see other categories?"), sender, phone_id_val)
+        state["step"] = "shop_more_categories"
+        save_single_user_state(sender)
+        return
+
+    matched = _match_product(prompt_lower)
+    if matched:
+        _select_product(sender, phone_id_val, lang, matched)
+        return
+
+    ask_yes_no_map = {
+        "shona": "Ndapota pindura 'hongu' kana 'aiwa'.",
+        "ndebele": "Ngicela uphendule 'yebo' noma 'cha'.",
+        "chinyanja": "Chonde yankha 'inde' kapena 'ayi'.",
+        "tonga": "Chabota, mupandule kuti 'iya' naa 'pe'.",
+        "bemba": "Napapata, yasuka 'ehe' kapena 'awe'.",
+        "lozi": "Ndapota, arabela 'inde' kamba 'ayi'.",
+    }
+    say(ask_yes_no_map.get(lang, "Please reply 'yes' or 'no'."), sender, phone_id_val)
+
+
+def handle_shop_product_name(sender, prompt, phone_id_val):
+    lang = user_states[sender].get("language", "english")
+    matched = _match_product(prompt.lower().strip())
+
+    if matched:
+        _select_product(sender, phone_id_val, lang, matched)
+    else:
+        not_found_map = {
+            "shona": "Handina kuwana chigadzirwa ichocho. Ndapota nyora zita rakanangana rechigadzirwa kubva kumureza.",
+            "ndebele": "Angitholi umkhiqizo lowo. Ngicela ubhale igama elicacile lomkhiqizo uvela ohlwini.",
+            "chinyanja": "Sindipeza chinthu ichi. Chonde lemba dzina loyenera la chinthu kuchokera pamndandanda.",
+            "tonga": "Tandajana cintu eeco. Ndapota, mulembesye zina lilungene lya cintu kuzwa pamudandaano.",
+            "bemba": "Nshasangile ichiputulwa ichi, lemba ishina chiputulwa ififine chilemoneka muchilangililo.",
+            "lozi": "Ha ni fumani swakupila se. Ndapota, ñola libizo le li nepahala la swakupila ku luhelo.",
+        }
+        say(not_found_map.get(lang, "I couldn't find that product. Please type the exact product name from the list."),
+            sender, phone_id_val)
+
+
+def handle_shop_more_categories(sender, prompt, phone_id_val):
+    lang = user_states[sender].get("language", "english")
+    intent = _interpret_shop_intent(prompt.lower().strip())
+
+    if intent == "decline":
+        say(BYE_MAP.get(lang, "Alright! Have a nice day. Say 'hi' if you have more questions."), sender, phone_id_val)
+        reset_flow(sender)
+    else:
+        _send_shop_categories(sender, phone_id_val, lang)
+
+
+# ── Quantity, cart, address, confirmation ────
+
+def _ask_quantity(sender, phone_id_val, lang, product_name):
+    qty_map = {
+        "shona": f"Zvakanaka! Mungada mangani e *{product_name}*?",
+        "ndebele": f"Kulungile! Ufuna izinga elingakanani le *{product_name}*?",
+        "chinyanja": f"Chabwino! Mukufuna kuchulukitsa *{product_name}* kangati?",
+        "tonga": f"Kabotu! manji buti ma *{product_name}* njo muyanda?",
+        "bemba": f"Cisuma! niyanga ama *{product_name}* mulefwaya?",
+        "lozi": f"Ho lokile! U bata ku landa *{product_name}* hañata mañi?",
+    }
+    say(qty_map.get(lang, f"Great! How many *{product_name}* would you like?"), sender, phone_id_val)
+    user_states[sender]["step"] = "shop_quantity"
+    save_single_user_state(sender)
+
+
+def handle_shop_quantity(sender, prompt, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+
+    qty_match = re.search(r"\d+", prompt)
+    qty = int(qty_match.group()) if qty_match else 0
+
+    if qty >= 1:
+        product = state.get("shop_selected_product", "Unknown")
+        state.setdefault("cart", []).append({
+            "product": product,
+            "price": state.get("shop_selected_price", "N/A"),
+            "quantity": qty,
+        })
+        more_map = {
+            "shona": f"✅ *{product}* x{qty} yawedzerwa! Ungada here kuwedzera chimwe chigadzirwa?",
+            "ndebele": f"✅ *{product}* x{qty} yengezwe! Ungathanda ukwengeza umkhiqizo wolunye?",
+            "chinyanja": f"✅ *{product}* x{qty} yaonjezedwa! Kodi mukufuna kuwonjezera chinthu china?",
+            "tonga": f"✅ *{product}* x{qty} canjila! Sena mulayanda kunjizya cintu cimwi?",
+            "bemba": f"✅ *{product}* x{qty} Yalundwapo! Bushe mulefwaya nafimbi?",
+            "lozi": f"✅ *{product}* x{qty} i yemelizwe! Kana u bata ku yema swakupila si liñwi?",
+        }
+        say(more_map.get(lang, f"✅ *{product}* x{qty} added! Would you like to add anything else?"),
+            sender, phone_id_val)
+        state["step"] = "shop_add_more"
+        save_single_user_state(sender)
+    else:
+        invalid_qty_map = {
+            "shona": "Ndapota pinda nhamba (semuenzaniso: 1, 2, 3).",
+            "ndebele": "Ngicela ufake inombolo (isibonelo: 1, 2, 3).",
+            "chinyanja": "Chonde lowetsani nambala (mwachitsanzo: 1, 2, 3).",
+            "tonga": "Ndakmba, mubesye nambala (mucikozyanyo: 1, 2, 3).",
+            "bemba": "Napapata, ingisha inambala (ichilangililo: 1, 2, 3).",
+            "lozi": "Ndapota, kenya nomolo (semuenzaniso: 1, 2, 3).",
+        }
+        say(invalid_qty_map.get(lang, "Please enter a number (e.g. 1, 2, 3)."), sender, phone_id_val)
+
+
+def handle_shop_add_more(sender, prompt, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+    prompt_lower = prompt.lower().strip()
+
+    matched = _match_product(prompt_lower)
+    if matched:
+        _select_product(sender, phone_id_val, lang, matched)
+        return
+
+    if _interpret_shop_intent(prompt_lower) == "browse":
+        _send_shop_categories(sender, phone_id_val, lang)
+        return
+
+    addr_map = {
+        "shona": "Zvakanaka! Ndapota tipa kero yako yekuendesa (guta, nharaunda, uye mamwe mashoko akabatsira).",
+        "ndebele": "Kulungile! Ngicela unike ikheli lakho lokuhambisa (idolobha, indawo, noma ulwazi olwengeziwe).",
+        "chinyanja": "Chabwino! Chonde tipatseni adilesi yanu yokumanga (mzinda, dera, ndi chilichonse china chopindulitsa).",
+        "tonga": "Kabotu! Ndapota, mutupe adilesi yanu yakuleeta zintu (tauni, ncobukala, alimwi azimwi zyo nga twabelesya kuzyba busena).",
+        "bemba": "Chisuma! Napapata, mpeele adilesi yenu iya kuletako ifyomuleshita (tawuni, cifulo, kabili nafimbi ifyo twingeshibilako pa nchende).",
+        "lozi": "Ho lokile! Ndapota, nipe aderesi ya hao ya ku alafa (tauni, sibaka, ni ze ñwi ze thusang).",
+    }
+    say(addr_map.get(lang, "Great! Please provide your delivery address (town, area, and any helpful details)."),
+        sender, phone_id_val)
+    state["step"] = "shop_address"
+    save_single_user_state(sender)
+
+
+def _save_orders_to_redis(sender, cart, address):
+    if not redis_client:
+        return
+    user_id = user_states[sender].get("user_id", sender)
+    for item in cart:
+        order = {
+            "user_id": user_id,
+            "sender": sender,
+            "product": item["product"],
+            "price": item["price"],
+            "quantity": item["quantity"],
+            "address": address,
+            "timestamp": datetime.now().isoformat(),
+            "status": "pending",
+        }
+        try:
+            order_key = f"orders:{sender}:{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+            redis_client.set(order_key, json.dumps(order))
+            logging.info(f"Order saved: {order_key} -> {order}")
+        except Exception as e:
+            logging.error(f"Error saving order: {e}")
+
+
+def _send_order_confirmation(sender, phone_id_val, lang, cart, address):
+    def build_lines(header, addr_label, closing):
+        parts = [header, ""]
+        for item in cart:
+            parts.append(f"  📦 {item['product']} x{item['quantity']} — {item['price']}")
+        parts += ["", f"📍 {addr_label}: {address}", closing]
+        return "\n".join(parts)
+
+    msg_map = {
+        "shona": build_lines("✅ *Odha Yakugamuchirwa!*", "Kero", "Tichakubata munguva pfupi. Ndatenda! 😊"),
+        "ndebele": build_lines("✅ *Ioda Ikugunyazwe!*", "Ikheli", "Sizokuthinta masinyane. Ngiyabonga! 😊"),
+        "chinyanja": build_lines("✅ *Dongosolo Lasinthidwa!*", "Adilesi", "Tidzakuumbanani posachedwapa. Zikomo! 😊"),
+        "tonga": build_lines("✅ *Oda Yatambulwa!*", "Adilesi", "Tula mwambila akaindi kaniini. Twatotela! 😊"),
+        "bemba": build_lines("✅ *Oda yapokelelwa!*", "Aderesi", "Twalalanda naimwe mukashita akanono. Natotela! 😊"),
+        "lozi": build_lines("✅ *Landa Le Li Amuhezwi!*", "Aderesi", "Lu ta ku ama ka nako ye nyinyani. Ndalumba! 😊"),
+    }
+    default = build_lines("✅ *Order Confirmed!*", "Delivery address", "We'll be in touch shortly. Thank you! 😊")
+    say(msg_map.get(lang, default), sender, phone_id_val)
+
+
+def handle_shop_address(sender, prompt, phone_id_val):
+    state = user_states[sender]
+    lang = state.get("language", "english")
+    address = prompt.strip()
+    cart = state.get("cart", [])
+
+    if cart:
+        _save_orders_to_redis(sender, cart, address)
+        _send_order_confirmation(sender, phone_id_val, lang, cart, address)
+    reset_flow(sender)
+
+
+SHOP_HANDLERS = {
+    "shop_interest": handle_shop_interest,
+    "shop_browse": handle_shop_browse,
+    "shop_order_decision": handle_shop_order_decision,
+    "shop_product_name": handle_shop_product_name,
+    "shop_more_categories": handle_shop_more_categories,
+    "shop_quantity": handle_shop_quantity,
+    "shop_add_more": handle_shop_add_more,
+    "shop_address": handle_shop_address,
+}
+
 
 # ─────────────────────────────────────────────
 #  MESSAGE ROUTER (no menus)
@@ -1547,10 +2091,16 @@ def handle_message(sender, prompt, phone_id_val):
         save_single_user_state(sender)
         if is_greeting_only(prompt) or is_referral_greeting(prompt):
             return
-    else:
+    elif not skip_language_update(step, prompt):
         maybe_update_language(sender, prompt)
 
     lang = state.get("language", "english")
+    step = state.get("step")
+
+    # 2b. A delivery address is free text, so it skips the keyword checks below
+    if step == "shop_address":
+        handle_shop_address(sender, prompt, phone_id_val)
+        return
 
     # 3. Ask for a human
     if is_human_agent_request(prompt):
@@ -1564,15 +2114,33 @@ def handle_message(sender, prompt, phone_id_val):
     # 4. Reset conversation context
     if is_reset_request(prompt):
         clear_conversation(sender)
+        reset_flow(sender)
         send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val, save=False)
         return
 
     # 5. Plain greeting, no model call needed
     if is_greeting_only(prompt) or is_referral_greeting(prompt):
+        reset_flow(sender)
         send(GREET_MAP.get(lang, "Hello! How can I help you today?"), sender, phone_id_val, save=False)
         return
 
-    # 6. Everything else is a free-form question
+    # 6. Answer to "anything else?" (yes / no / a new question)
+    if step == "follow_up":
+        if handle_follow_up_reply(sender, prompt, phone_id_val):
+            return
+        # otherwise it is a new question: fall through to MedGemma
+
+    # 7. Shop flow
+    elif step in SHOP_HANDLERS:
+        if step in SHOP_ESCAPABLE and looks_like_new_question(prompt):
+            # A real question in the middle of shopping: drop the order flow and answer it.
+            reset_flow(sender)
+            save_user_conversation(sender, "user", prompt)   # shop steps do not store messages
+        else:
+            SHOP_HANDLERS[step](sender, prompt, phone_id_val)
+            return
+
+    # 8. Everything else is a free-form question
     answer_user(sender, prompt, phone_id_val)
 
 
@@ -1666,7 +2234,10 @@ def _process_message(message, value):
     if not is_new:
         user_states[sender]["first_message"] = False
 
-    save_user_conversation(sender, "user", prompt)
+    # Shop replies (quantities, addresses, product names) must not enter the history,
+    # because the history is what MedGemma sees.
+    if user_states[sender].get("step") not in SHOP_STEPS:
+        save_user_conversation(sender, "user", prompt)
 
     referral = extract_referral_source(prompt)
     if referral:
