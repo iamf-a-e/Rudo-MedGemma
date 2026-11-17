@@ -4,10 +4,10 @@ translategemma_client.py
 Translation layer for the Rudo bot.
 
 Engines:
-    TranslateGemma  self-hosted HTTP endpoint (languages in TG_LANGS)
-    Gemini          direct translation for languages not in TG_LANGS (for example Bemba, Tonga,
-                    Lozi), as a fallback when TranslateGemma fails, and as a reviewer of
-                    TranslateGemma output. Gemini translation uses the same approach as Rudo's
+    TranslateGemma  self-hosted HTTP endpoint (languages in TG_IN_LANGS / TG_OUT_LANGS)
+    Gemini          direct translation for everything else (English -> local by default, and
+                    Bemba, Tonga, Lozi), as a fallback when TranslateGemma fails, and as a
+                    reviewer of TranslateGemma output. Gemini translation uses the same approach as Rudo's
                     ask_gemini: native-language enforcement lines, English-leak detection, and
                     one stricter retry.
 
@@ -23,9 +23,15 @@ Env vars:
     TRANSLATEGEMMA_MAX_CHARS  max characters per request, longer text is chunked (default 1200)
     TRANSLATE_LANGS           Rudo language NAMES that must be pivoted through English
                               (default: all six non-English languages)
-    TG_LANGS                  Rudo language NAMES that go to TranslateGemma first
-                              (default: shona,chinyanja,ndebele). Other pivoted languages go
-                              straight to Gemini.
+    TG_IN_LANGS               Rudo language NAMES whose local -> English hop goes to TranslateGemma
+                              first (default: the value of TG_LANGS, else shona,chinyanja,ndebele).
+                              Anything else goes straight to Gemini. Use "none" to send every
+                              inbound hop to Gemini.
+    TG_OUT_LANGS              Same, for the English -> local hop, which is the text people read
+                              as medical advice. Default: none, so outbound is always Gemini.
+    TG_LANGS                  Legacy. Only used as the default for TG_IN_LANGS.
+    TRANSLATE_DEBUG           "1" = log the full text in and out of every hop (this contains
+                              message content, so turn it off again after testing). Default "0".
     VERIFY_OUT                "1" (default) = Gemini reviews EVERY TranslateGemma output going
                               English -> user language, because those errors reach the person
                               as medical advice. "0" = only outputs flagged by the heuristics.
@@ -72,15 +78,20 @@ PIVOT_LANGS = {
     if x.strip()
 }
 
+def _lang_set(raw: str) -> set:
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
 _DEFAULT_TG = "shona,chinyanja,ndebele"
-TG_LANGS = {
-    x.strip().lower()
-    for x in os.environ.get("TG_LANGS", _DEFAULT_TG).split(",")
-    if x.strip()
-}
+# local -> English: TranslateGemma first (legacy TG_LANGS is honoured as the default).
+TG_IN_LANGS = _lang_set(os.environ.get("TG_IN_LANGS", os.environ.get("TG_LANGS", _DEFAULT_TG)))
+# English -> local: Gemini by default, because this is the text people read as medical advice.
+TG_OUT_LANGS = _lang_set(os.environ.get("TG_OUT_LANGS", ""))
+TG_LANGS = TG_IN_LANGS | TG_OUT_LANGS
 
 VERIFY_ALL = os.environ.get("VERIFY_ALL", "0") == "1"
 VERIFY_OUT = os.environ.get("VERIFY_OUT", "1") == "1"
+TRANSLATE_DEBUG = os.environ.get("TRANSLATE_DEBUG", "0") == "1"
 
 GEM_TRANSLATE_TEMP = float(os.environ.get("GEM_TRANSLATE_TEMP", "0.3"))
 GEM_RETRY_TEMP = 0.2
@@ -356,6 +367,12 @@ def _looks_unsure(src_text: str, out: str) -> bool:
     return False
 
 
+def _dbg(engine: str, src: str, tgt: str, text: str, out: str):
+    """Full text of one hop, so you can see exactly which step degrades the message."""
+    if TRANSLATE_DEBUG:
+        logging.info("[translate-debug] %s %s->%s\n  IN : %r\n  OUT: %r", engine, src, tgt, text, out)
+
+
 # ─────────────────────────────────────────────
 #  PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────
@@ -365,23 +382,30 @@ def translate(text: str, src: str, tgt: str) -> str:
     Translate `text` from Rudo language name `src` to `tgt` (for example "shona" -> "english").
     Raises on any failure so the caller (_retry in the bot) can decide what to do.
 
-    Routing:
-        non-English side not in TG_LANGS -> Gemini
-        otherwise                        -> TranslateGemma, Gemini fallback if it fails,
-                                            Gemini review when:
-                                              VERIFY_ALL is on, or
-                                              VERIFY_OUT is on and the direction is English -> local, or
-                                              the heuristics flag the output as unsure
+    Routing (per direction):
+        local -> English: language in TG_IN_LANGS  -> TranslateGemma, else Gemini
+        English -> local: language in TG_OUT_LANGS -> TranslateGemma, else Gemini
+                          (TG_OUT_LANGS is empty by default, so outbound is Gemini)
+        When TranslateGemma is used: Gemini fallback if it fails or TRANSLATEGEMMA_URL is unset,
+        and Gemini review when:
+            VERIFY_ALL is on, or
+            VERIFY_OUT is on and the direction is English -> local, or
+            the heuristics flag the output as unsure
     """
     if not text or not text.strip() or src == tgt:
         return text
-    if not TG_URL:
-        raise RuntimeError("TRANSLATEGEMMA_URL is not set")
 
-    lang = tgt if src == "english" else src          # the non-English side
+    outbound = src == "english"
+    lang = tgt if outbound else src                  # the non-English side
+    use_tg = lang in (TG_OUT_LANGS if outbound else TG_IN_LANGS)
 
-    if lang not in TG_LANGS:
+    if use_tg and not TG_URL:
+        logging.warning("[translate] TRANSLATEGEMMA_URL is not set, using Gemini")
+        use_tg = False
+
+    if not use_tg:
         result = _gemini_translate(text, src, tgt)
+        _dbg("gemini", src, tgt, text, result)
         logging.info(f"[translate] {src}->{tgt} via Gemini ok ({len(text)} chars in, {len(result)} out)")
         return result
 
@@ -389,14 +413,17 @@ def translate(text: str, src: str, tgt: str) -> str:
         out = _tg_translate(text, src, tgt)
     except Exception:
         logging.exception(f"[translate] TranslateGemma failed for {src}->{tgt}, using Gemini")
-        return _gemini_translate(text, src, tgt)
+        result = _gemini_translate(text, src, tgt)
+        _dbg("gemini-fallback", src, tgt, text, result)
+        return result
+    _dbg("translategemma", src, tgt, text, out)
 
-    outbound = src == "english"
     if VERIFY_ALL or (VERIFY_OUT and outbound) or _looks_unsure(text, out):
         ok, fixed = _gemini_review(text, src, out, tgt)
         logging.info(f"[translate] review {src}->{tgt}: ok={ok} corrected={'yes' if (not ok and fixed) else 'no'}")
         if not ok and fixed:
             logging.warning("[translate] Gemini overrode TG [%s->%s]: TG=%r GEM=%r", src, tgt, out, fixed)
+            _dbg("gemini-review-override", src, tgt, text, fixed)
             return fixed
 
     logging.info(f"[translate] {src}->{tgt} ok ({len(text)} chars in, {len(out)} chars out)")
