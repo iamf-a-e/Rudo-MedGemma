@@ -9,3 +9,4 @@ upstash-redis
 packaging>=23.0
 PyPDF2
 requests
+gradio_client
