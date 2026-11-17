@@ -1,14 +1,4 @@
-"""Safety guardrails around the MedGemma answers, so they behave like the rest of the Rudo bot.
 
-1. Self-harm check on the user's message -> dedicated supportive message, model answer NOT sent.
-2. Danger-sign check on the user's message -> urgent "see a doctor" line goes FIRST.
-3. "See a doctor" safety footer on every normal answer (same idea as the Gemini disclaimer).
-4. Output hygiene for a small fine-tuned model: strip template/control tokens, drop repetition
-   loops and empty output, trim a cut-off last sentence.
-
-The referral lines below are copied verbatim from the bot's existing "doctor" menu option in main.py,
-so no new medical wording is introduced in any language.
-"""
 import logging
 import os
 import re
@@ -23,11 +13,7 @@ SEE_DOCTOR = {
 }
 SEE_DOCTOR_DEFAULT = "See a doctor immediately if you experience severe pain, heavy bleeding, or high fever."
 
-# Message for someone who may be thinking of harming themselves.
-# TODO (clinician): have a Zimbabwe/Zambia mental-health clinician review the English text, add the
-# local helpline numbers, and provide reviewed translations for each language below.
-# Until a language has a reviewed translation it falls back to the English text, which is better
-# than an unreviewed machine translation on a topic this sensitive.
+
 SELF_HARM_SUPPORT = {
     # "shona": "...",
     # "ndebele": "...",
