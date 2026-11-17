@@ -1,28 +1,4 @@
-"""
-nlp_endpoints.py  -  /detect and /translate endpoints for the GPU box.
 
-Add two lines to medgemma_server.py (after `app = Flask(__name__)` and `_lock = ...`):
-
-    import nlp_endpoints
-    nlp_endpoints.register(app, gpu_lock=_lock)
-
-Extra installs on the GPU box:  pip install -q fasttext-predict sentencepiece   (transformers is already there)
-
-Endpoints (both need  Authorization: Bearer $MEDGEMMA_TOKEN):
-
-  POST /translate  {"text": "...", "source_lang_code": "sn", "target_lang_code": "en"}
-       -> {"translation": "...", "engine": "nllb-200", "approximate": false}
-       Same contract as translategemma_client.py, so that client works unchanged. Uses NLLB-200.
-       Supported codes: en, ny, bem, sn, nd (nd is approximated by Zulu).
-       Lozi (loz) and Tonga (toi) are refused with HTTP 422 rather than translated badly.
-       Output in the wrong script is also refused with HTTP 422.
-
-  POST /detect     {"text": "..."}
-       -> {"language": "shona" | null, "confidence": 0.97, "scores": {...}}
-       Uses GlotLID, restricted to the 7 Rudo languages. null means "unsure".
-
-Env: MEDGEMMA_TOKEN (required), HF_TOKEN (optional), NLLB_ID, DETECT_MIN_CONF (default 0.5)
-"""
 import hmac
 import logging
 import os
