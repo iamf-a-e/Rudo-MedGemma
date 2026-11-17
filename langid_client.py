@@ -1,9 +1,4 @@
-"""
-langid_client.py - bot-side client for the /detect endpoint. Never raises: returns None on any failure
-so detect_language() can fall through to Gemini and then to keyword scoring.
 
-Env: LANGID_URL (defaults to MEDGEMMA_URL + "/detect"), MEDGEMMA_TOKEN, LANGID_TIMEOUT (default 4 seconds)
-"""
 import logging
 import os
 
