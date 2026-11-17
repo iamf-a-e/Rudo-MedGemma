@@ -1,25 +1,4 @@
-"""
-db.py
- 
-Supabase storage for the Rudo bot. It talks to Supabase's REST API (PostgREST) with plain
-`requests`, so there is no extra SDK to install and cold starts on Vercel stay light.
 
-Env vars:
-    SUPABASE_URL           https://<project-ref>.supabase.co
-    SUPABASE_SERVICE_KEY   a SECRET key (sb_secret_...) or the legacy service_role key.
-                           Server side only. Never put it in a browser, an app or a public repo.
-    SUPABASE_TIMEOUT       seconds per request (default 8)
-
-Tables (see supabase_schema.sql):
-    users      one row per WhatsApp user: language, user_id, step and the full state as jsonb
-    messages   one row per chat message, with an optional English version (message_en)
-    referrals  where each user came from (poster, flyer, pharmacy)
-    orders     shop orders
-    kv         tiny key/value table with expiry, used for agent sessions and message de-duplication
-
-`kv` is exposed as `db.kv` with the same get / set(ex=, nx=) / delete calls the bot already used,
-so the agent hand-off code needed no changes.
-"""
 
 import json
 import logging
