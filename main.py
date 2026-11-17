@@ -1366,6 +1366,8 @@ def generate_reply(sender, prompt, lang):
     except Exception as e:
         logging.error(f"[generate_reply] {type(e).__name__}: {e}", exc_info=True)
 
+    logging.info(f"[pipeline] prompt={prompt!r} q_en={q_en!r} reply_en={reply_en!r} local={local_text!r}")   
+
     # Guardrails get the original wording and, when we have it, the English translation,
     # so danger sign checks work whichever language the keywords live in.
     guard_question = f"{prompt}\n{q_en}" if q_en else prompt
