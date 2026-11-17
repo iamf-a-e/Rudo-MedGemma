@@ -24,8 +24,11 @@ Env vars:
     TG_LANGS                  Rudo language NAMES that go to TranslateGemma first
                               (default: shona,chinyanja,ndebele). Other pivoted languages go
                               straight to Gemini.
-    VERIFY_ALL                "1" = Gemini reviews every TranslateGemma output (safest, slower).
-                              "0" = only outputs flagged by the heuristics are reviewed.
+    VERIFY_OUT                "1" (default) = Gemini reviews EVERY TranslateGemma output going
+                              English -> user language, because those errors reach the person
+                              as medical advice. "0" = only outputs flagged by the heuristics.
+    VERIFY_ALL                "1" = Gemini reviews every TranslateGemma output in both directions
+                              (safest, slowest). "0" (default) = see VERIFY_OUT.
     GEN_API                   Gemini key
     GEN_MODEL                 Gemini model name (default gemini-2.5-flash)
 
@@ -72,6 +75,7 @@ TG_LANGS = {
 }
 
 VERIFY_ALL = os.environ.get("VERIFY_ALL", "0") == "1"
+VERIFY_OUT = os.environ.get("VERIFY_OUT", "1") == "1"
 
 # Terms that code-switching speakers keep in English. They are swapped for opaque
 # tokens before translation and restored afterwards. Longest terms first.
@@ -283,7 +287,10 @@ def translate(text: str, src: str, tgt: str) -> str:
     Routing:
         non-English side not in TG_LANGS -> Gemini
         otherwise                        -> TranslateGemma, Gemini fallback if it fails,
-                                            Gemini review when VERIFY_ALL or the output looks unsure
+                                            Gemini review when:
+                                              VERIFY_ALL is on, or
+                                              VERIFY_OUT is on and the direction is English -> local, or
+                                              the heuristics flag the output as unsure
     """
     if not text or not text.strip() or src == tgt:
         return text
@@ -303,8 +310,10 @@ def translate(text: str, src: str, tgt: str) -> str:
         logging.exception(f"[translate] TranslateGemma failed for {src}->{tgt}, using Gemini")
         return _gemini_translate(text, src, tgt)
 
-    if VERIFY_ALL or _looks_unsure(text, out):
+    outbound = src == "english"
+    if VERIFY_ALL or (VERIFY_OUT and outbound) or _looks_unsure(text, out):
         ok, fixed = _gemini_review(text, src, out, tgt)
+        logging.info(f"[translate] review {src}->{tgt}: ok={ok} corrected={'yes' if (not ok and fixed) else 'no'}")
         if not ok and fixed:
             logging.warning("[translate] Gemini overrode TG [%s->%s]: TG=%r GEM=%r", src, tgt, out, fixed)
             return fixed
