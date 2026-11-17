@@ -1,41 +1,4 @@
-"""
-Rudo WhatsApp bot (Dawa Health)
 
-Flow for every text message:
-    1. Agent relay checks (human agent sessions bypass the bot completely)
-    2. Language detection (Gemini classifier, keyword scoring as offline fallback)
-    3. For Shona, Ndebele, Chinyanja, Bemba, Tonga and Lozi:
-           TranslateGemma (user language -> English)
-           MedGemma answers in English
-           guardrails (compose_reply) run on the result
-           TranslateGemma (English -> user language)
-       English goes straight to MedGemma.
-    4. Reply is sent, followed by "Is there anything else I can help you with?".
-         * "no"  -> Rudo offers the product shop (categories, quantity, address, order saved to Redis)
-         * "yes" -> Rudo asks for the question
-         * anything else is treated as a new question and goes straight to MedGemma
-       There are no menus. Every message outside the short follow-up / shop steps is free-form chat.
-
-Gemini is used ONLY for language detection. Replies never come from Gemini.
-
-History rules (these keep MedGemma answering in English):
-    * Fixed UI text (welcome, greetings, resets, agent hand-offs, follow-up and shop messages,
-      failure messages) is sent with save=False, so it never enters the conversation history.
-    * Shop replies and bare yes/no answers are not kept in the history either.
-    * For pivoted languages only turns that have an English version (message_en) are passed to
-      MedGemma. Local-language text never reaches the model.
-    * The model reply is checked to be English before it is translated back. One retry without
-      history, then the user gets the failure message instead of garbled medical advice.
-
-Env vars:
-    WA_TOKEN, PHONE_ID, OWNER_PHONE, VERIFY_TOKEN (default "BOT")
-    SUPABASE_URL, SUPABASE_SERVICE_KEY
-    GEN_API                       Gemini key (language detection only)
-    MEDGEMMA_URL, MEDGEMMA_TOKEN, MEDGEMMA_TIMEOUT      read by medgemma_client.py
-    TRANSLATEGEMMA_URL, TRANSLATEGEMMA_TOKEN,
-    TRANSLATEGEMMA_TIMEOUT        read by translategemma_client.py
-    TRANSLATE_LANGS               optional, languages to pivot through English
-"""
 
 import json
 import logging
