@@ -29,7 +29,7 @@ History rules (these keep MedGemma answering in English):
 
 Env vars:
     WA_TOKEN, PHONE_ID, OWNER_PHONE, VERIFY_TOKEN (default "BOT")
-    UPSTASH_REDIS_URL, UPSTASH_REDIS_TOKEN
+    SUPABASE_URL, SUPABASE_SERVICE_KEY
     GEN_API                       Gemini key (language detection only)
     MEDGEMMA_URL, MEDGEMMA_TOKEN, MEDGEMMA_TIMEOUT      read by medgemma_client.py
     TRANSLATEGEMMA_URL, TRANSLATEGEMMA_TOKEN,
@@ -48,12 +48,18 @@ from datetime import datetime
 import google.generativeai as genai
 import requests
 from flask import Flask, jsonify, render_template, request
-from upstash_redis import Redis
+import db
 
 from medgemma_client import ask_medgemma, medgemma_enabled, pairs_from_history
 from medgemma_guardrails import clean_model_output, compose_reply
 from products_data import products_by_category
 from translategemma_client import needs_translation, translate, translategemma_enabled
+from training import (  # noqa: F401
+    instructions, product_images, products, pregnancy_data, pregnancy_data_shona,
+    pregnancy_data_ndebele, pregnancy_data_tonga, pregnancy_data_chinyanja,
+    pregnancy_data_bemba, pregnancy_data_lozi, cervical_cancer_data,
+    cervical_cancer_data_chinyanja, cervical_cancer_data_lozi,
+)
 
 logging.basicConfig(level=logging.INFO, force=True)
 
@@ -91,21 +97,19 @@ safety_settings = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
 ]
 
-# Upstash Redis
-redis_url = os.environ.get("UPSTASH_REDIS_URL")
-redis_token = os.environ.get("UPSTASH_REDIS_TOKEN")
-
-if redis_url and redis_token:
+# Supabase. `redis_client` keeps its old name: it is a small key/value layer (db.kv) with the
+# same get / set(ex, nx) / delete calls, used for agent hand-offs and message de-duplication.
+# Users, chat history, referrals and orders live in their own tables (see db.py).
+if db.enabled():
+    redis_client = db.kv
     try:
-        redis_client = Redis(url=redis_url, token=redis_token)
-        redis_client.ping()
-        logging.info("Successfully connected to Upstash Redis")
+        db.kv.ping()
+        logging.info("Successfully connected to Supabase")
     except Exception as e:
-        logging.error(f"Failed to connect to Upstash Redis: {e}")
-        redis_client = None
+        logging.error(f"Supabase connection check failed: {e}")
 else:
     redis_client = None
-    logging.warning("UPSTASH_REDIS_URL or UPSTASH_REDIS_TOKEN not set, Redis functionality disabled")
+    logging.warning("SUPABASE_URL or SUPABASE_SERVICE_KEY not set, persistence disabled")
 
 # Per-worker cache. Redis is the source of truth, the webhook refreshes from it on every message.
 user_states = {}
@@ -143,24 +147,12 @@ AGENT_PHONES_NORM = {normalize_phone(p) for p in AGENTS.values()}
 # ─────────────────────────────────────────────
 
 def save_single_user_state(sender):
-    if redis_client and sender in user_states:
-        try:
-            redis_client.set(f"user_state:{sender}", json.dumps(user_states[sender]))
-        except Exception as e:
-            logging.error(f"Error saving state for {sender}: {e}")
+    if sender in user_states:
+        db.save_user_state(sender, user_states[sender])
 
 
 def load_user_state(sender):
-    if redis_client:
-        try:
-            state_data = redis_client.get(f"user_state:{sender}")
-            if state_data:
-                if isinstance(state_data, (dict, list)):
-                    return state_data
-                return json.loads(state_data)
-        except Exception as e:
-            logging.error(f"Error loading user state for {sender}: {e}")
-    return None
+    return db.get_user_state(sender)
 
 
 def ensure_user_state(sender, refresh=False):
@@ -196,80 +188,26 @@ def ensure_user_state(sender, refresh=False):
 # ─────────────────────────────────────────────
 
 def get_user_conversation(sender):
-    if redis_client:
-        try:
-            history = redis_client.get(f"conversation:{sender}")
-            if not history:
-                return []
-            if isinstance(history, list):
-                return history
-            if isinstance(history, str):
-                parsed = json.loads(history)
-                if isinstance(parsed, list):
-                    return parsed
-            return []
-        except Exception as e:
-            logging.error(f"Error getting conversation: {e}")
-            return []
-    return []
+    return db.get_messages(sender)
 
 
 def save_user_conversation(sender, role, message, message_en=None):
     """message_en is the English version of the message, stored for pivoted languages."""
-    if redis_client:
-        try:
-            conversation = get_user_conversation(sender)
-            if not isinstance(conversation, list):
-                conversation = []
-            entry = {
-                "role": role,
-                "message": str(message),
-                "timestamp": datetime.now().isoformat(),
-            }
-            if message_en:
-                entry["message_en"] = str(message_en)
-            conversation.append(entry)
-            if len(conversation) > 100:
-                conversation = conversation[-100:]
-            redis_client.set(f"conversation:{sender}", json.dumps(conversation))
-        except Exception as e:
-            logging.error(f"Error saving conversation: {e}")
+    db.add_message(sender, role, str(message), message_en)
 
 
 def set_last_message_en(sender, role, text_en):
     """Attach an English translation to the most recent stored message of `role`."""
-    if not redis_client or not text_en:
-        return
-    try:
-        conversation = get_user_conversation(sender)
-        for entry in reversed(conversation):
-            if entry.get("role") == role:
-                entry["message_en"] = str(text_en)
-                break
-        redis_client.set(f"conversation:{sender}", json.dumps(conversation))
-    except Exception as e:
-        logging.error(f"Error attaching English text to conversation: {e}")
+    db.set_last_message_en(sender, role, text_en)
 
 
 def clear_conversation(sender):
-    if redis_client:
-        try:
-            redis_client.delete(f"conversation:{sender}")
-        except Exception as e:
-            logging.error(f"Error clearing conversation: {e}")
+    db.delete_messages(sender)
 
 
 def drop_last_user_message(sender):
     """Remove a bare yes/no from the history so MedGemma never sees it."""
-    if not redis_client:
-        return
-    try:
-        conv = get_user_conversation(sender)
-        if conv and conv[-1].get("role") == "user":
-            conv.pop()
-            redis_client.set(f"conversation:{sender}", json.dumps(conv))
-    except Exception as e:
-        logging.error(f"Error dropping last user message: {e}")
+    db.delete_last_message_if_role(sender, "user")
 
 
 # ─────────────────────────────────────────────
@@ -747,21 +685,8 @@ def extract_referral_source(prompt: str):
 
 
 def save_referral_source(sender, source):
-    if not redis_client:
-        logging.warning("Redis not available, referral not saved.")
-        return
-    try:
-        entry = {
-            "sender": sender,
-            "source": source,
-            "user_id": user_states.get(sender, {}).get("user_id", "unregistered"),
-            "timestamp": datetime.now().isoformat(),
-        }
-        key = f"referrals:{sender}:{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-        redis_client.set(key, json.dumps(entry))
-        logging.info(f"Referral saved {key}: {entry}")
-    except Exception as e:
-        logging.error(f"Error saving referral: {e}")
+    db.add_referral(sender, source, user_states.get(sender, {}).get("user_id", "unregistered"))
+    logging.info(f"Referral saved for {sender}: {source}")
 
 
 # QR codes open WhatsApp with a prefilled "Hi DawaMom, I got connected from <place>" message.
@@ -1929,26 +1854,11 @@ def handle_shop_add_more(sender, prompt, phone_id_val):
 
 
 def _save_orders_to_redis(sender, cart, address):
-    if not redis_client:
-        return
+    """Name kept so callers do not change. Orders now go to the Supabase `orders` table."""
     user_id = user_states[sender].get("user_id", sender)
     for item in cart:
-        order = {
-            "user_id": user_id,
-            "sender": sender,
-            "product": item["product"],
-            "price": item["price"],
-            "quantity": item["quantity"],
-            "address": address,
-            "timestamp": datetime.now().isoformat(),
-            "status": "pending",
-        }
-        try:
-            order_key = f"orders:{sender}:{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-            redis_client.set(order_key, json.dumps(order))
-            logging.info(f"Order saved: {order_key} -> {order}")
-        except Exception as e:
-            logging.error(f"Error saving order: {e}")
+        db.add_order(sender, user_id, item["product"], item["price"], item["quantity"], address)
+        logging.info(f"Order saved for {sender}: {item}")
 
 
 def _send_order_confirmation(sender, phone_id_val, lang, cart, address):
