@@ -7,7 +7,9 @@ Engines:
     TranslateGemma  self-hosted HTTP endpoint (languages in TG_LANGS)
     Gemini          direct translation for languages not in TG_LANGS (for example Bemba, Tonga,
                     Lozi), as a fallback when TranslateGemma fails, and as a reviewer of
-                    TranslateGemma output
+                    TranslateGemma output. Gemini translation uses the same approach as Rudo's
+                    ask_gemini: native-language enforcement lines, English-leak detection, and
+                    one stricter retry.
 
 Server contract for TranslateGemma (you host this next to MedGemma on a GPU box):
     POST TRANSLATEGEMMA_URL
@@ -31,6 +33,9 @@ Env vars:
                               (safest, slowest). "0" (default) = see VERIFY_OUT.
     GEN_API                   Gemini key
     GEN_MODEL                 Gemini model name (default gemini-2.5-flash)
+    GEM_TRANSLATE_TEMP        temperature for the first Gemini translation attempt (default 0.3).
+                              Set to 0.5 to match Rudo's ask_gemini exactly. The strict retry
+                              always uses 0.2.
 
 Use language names in the env vars, for example TRANSLATE_LANGS=shona,chinyanja,ndebele,bemba,tonga,lozi
 (not codes like sn, ny).
@@ -77,6 +82,9 @@ TG_LANGS = {
 VERIFY_ALL = os.environ.get("VERIFY_ALL", "0") == "1"
 VERIFY_OUT = os.environ.get("VERIFY_OUT", "1") == "1"
 
+GEM_TRANSLATE_TEMP = float(os.environ.get("GEM_TRANSLATE_TEMP", "0.3"))
+GEM_RETRY_TEMP = 0.2
+
 # Terms that code-switching speakers keep in English. They are swapped for opaque
 # tokens before translation and restored afterwards. Longest terms first.
 PROTECTED_TERMS = ["cervical cancer", "Dawa Health", "DawaMom", "antenatal", "ultrasound", "HPV"]
@@ -91,6 +99,24 @@ GEM_NAMES = {
     "tonga": "Tonga (Chitonga, Zambia)",
     "lozi": "Lozi (Silozi)",
 }
+
+# Per-language enforcement lines, the same ones Rudo uses in _get_lang_enforce.
+LANG_ENFORCE = {
+    "shona":     "Pindura muchiShona chete. Usashandise Chirungu.",
+    "ndebele":   "Phendula ngesiNdebele kuphela. Ungasebenzisi isiNgisi.",
+    "chinyanja": "Yankhani mu Chichewa/Chinyanja basi. Osagwiritsa ntchito Chingerezi.",
+    "lozi":      "Arabela ka Silozi feela. U se ke wa sebelisa Siingelesi.",
+    "bemba":     "Yasuka mu Cibemba fye. Wibonfya icingeleshi.",
+    "tonga":     "Mupandule mu Chitonga buyo. Mutabelezyi Ciingelezi.",
+}
+
+# Same English tell-words and threshold as Rudo's looks_like_english_leak.
+_ENGLISH_TELLS = {
+    "the", "is", "are", "you", "your", "how", "many", "months", "week", "weeks",
+    "should", "would", "could", "will", "does", "doctor", "please", "thank",
+    "and", "with", "this", "that", "have", "has", "when", "what", "can",
+}
+_LEAK_THRESHOLD = 0.15
 
 # Thinking tokens count against max_output_tokens on Gemini 2.5, so keep this generous.
 # finish_reason=2 (MAX_TOKENS) in the logs means this budget ran out.
@@ -217,21 +243,76 @@ def _finished_ok(response) -> bool:
     return getattr(reason, "value", reason) == 1  # 1 == STOP
 
 
-def _gemini_translate(text: str, src: str, tgt: str) -> str:
-    """Gemini translation with masking. Raises on any failure, including truncation."""
-    masked, mapping = _mask(text)
-    prompt = (
-        f"Translate the following text from {GEM_NAMES[src]} to {GEM_NAMES[tgt]}. "
-        "It is part of a maternal health chat. Keep the medical meaning exact, "
-        "keep numbers, names, units and tokens like XQ0Z unchanged, and do not add or remove advice. "
-        "Return only the translation.\n\n" + masked
-    )
-    r = _gem().generate_content(prompt, generation_config=_GEN_CFG)
+def _english_leak_ratio(text: str) -> float:
+    """Share of words that are common English tell-words. 0.0 for very short text."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    if len(words) < 6:
+        return 0.0
+    return sum(1 for w in words if w in _ENGLISH_TELLS) / len(words)
+
+
+def _looks_like_english_leak(text: str, tgt: str) -> bool:
+    """Only meaningful when the target is a local language."""
+    if tgt == "english" or not text:
+        return False
+    return _english_leak_ratio(text) > _LEAK_THRESHOLD
+
+
+def _gemini_generate(prompt: str, temperature: float) -> str:
+    """One Gemini call. Raises if blocked, truncated or empty."""
+    cfg = {**_GEN_CFG, "temperature": temperature}
+    r = _gem().generate_content(prompt, generation_config=cfg)
     if not _finished_ok(r):
         raise ValueError("Gemini translation did not finish normally (blocked or truncated)")
     out = (r.text or "").strip()
     if not out:
         raise ValueError("Gemini returned an empty translation")
+    return out
+
+
+def _gemini_translate(text: str, src: str, tgt: str) -> str:
+    """
+    Gemini translation written the way Rudo's ask_gemini works: native-language
+    enforcement before and after the prompt, English-leak detection, and one stricter
+    retry. Raises on any failure, including truncation.
+    """
+    masked, mapping = _mask(text)
+
+    if tgt == "english":
+        enforce = "Respond in English only."
+    else:
+        enforce = LANG_ENFORCE.get(tgt, f"Respond in {GEM_NAMES[tgt]} only.")
+
+    base_prompt = (
+        f"{enforce}\n\n"
+        "You are a professional medical translator for a maternal health chat on WhatsApp. "
+        f"Translate the following message from {GEM_NAMES[src]} into clear, simple, natural "
+        f"{GEM_NAMES[tgt]}, the way a local health worker would say it. "
+        "Keep the medical meaning exact, including danger signs, numbers, units and names. "
+        "Do not add or remove advice. Keep tokens like XQ0Z unchanged. "
+        "Do not start with phrases like 'Sure' or 'Here is the translation'. "
+        "Return only the translation.\n\n"
+        f"Message:\n{masked}\n\n"
+        f"{enforce}"
+    )
+
+    out = _gemini_generate(base_prompt, temperature=GEM_TRANSLATE_TEMP)
+
+    if _looks_like_english_leak(out, tgt):
+        logging.warning(f"[gemini_translate] English leak detected for {tgt}, retrying with stricter prompt")
+        strict_prompt = (
+            f"CRITICAL: Your entire reply must be written only in {GEM_NAMES[tgt]}. "
+            "Do not include any English sentences or phrases, even if the original contains "
+            "English words (except protected tokens like XQ0Z).\n\n" + base_prompt
+        )
+        try:
+            retry = _gemini_generate(strict_prompt, temperature=GEM_RETRY_TEMP)
+            # Keep whichever attempt has less English in it.
+            if _english_leak_ratio(retry) < _english_leak_ratio(out):
+                out = retry
+        except Exception:
+            logging.exception("[gemini_translate] strict retry failed, keeping first attempt")
+
     return _unmask(out, mapping)
 
 
