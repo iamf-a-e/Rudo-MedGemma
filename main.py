@@ -41,7 +41,7 @@ from medgemma_client import ask_medgemma, medgemma_enabled, pairs_from_history
 from medgemma_guardrails import clean_model_output, compose_reply
 from translategemma_client import needs_translation, translate, translategemma_enabled
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, force=True)
 
 # ─────────────────────────────────────────────
 #  CONFIG
