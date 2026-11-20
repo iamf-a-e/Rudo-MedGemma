@@ -1152,20 +1152,61 @@ CONSENT_FORM_URL = (
     "&entry.1012319286=The+text+of+my+messages%2C+including+what+my+voice+notes+say"
 )
 
-# Sent once, with the welcome, to every new number. Add reviewed translations keyed by
-# language ("shona", "bemba", ...). Languages without one get the English text.
+# Sent once, right after the welcome, to every new number, with a button that opens the form
+# so the long link never shows. Add reviewed translations keyed by language ("shona",
+# "bemba", ...). Languages without one get the English text.
 TERMS_NOTICE_MAP = {
     "english": (
         "By chatting with me, you agree to Dawa Health's terms, and Dawa Health may use your "
         "conversations, with your name and number removed, to improve its AI. Saying no does "
-        "not change the help you get from me. To read the terms or say no, open this form:"
+        "not change the help you get from me. You can read the terms or say no here:"
     ),
+}
+# Button label. WhatsApp allows at most 20 characters.
+TERMS_BUTTON_MAP = {
+    "english": "Read terms / say no",
 }
 
 
-def terms_notice(lang):
+def send_cta_url(phone_number, body_text, button_text, url, phone_id_val):
+    """A message with one button that opens `url`, so the raw link is not shown."""
+    endpoint = f"https://graph.facebook.com/v19.0/{phone_id_val}/messages"
+    headers = {
+        "Authorization": f"Bearer {wa_token}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": phone_number,
+        "type": "interactive",
+        "interactive": {
+            "type": "cta_url",
+            "body": {"text": body_text},
+            "action": {
+                "name": "cta_url",
+                "parameters": {"display_text": button_text[:20], "url": url},
+            },
+        },
+    }
+    resp = requests.post(endpoint, headers=headers, json=data, timeout=15)
+    logging.info(f"CTA URL send to {phone_number}: {resp.status_code}")
+    if resp.status_code >= 400:
+        logging.error(f"CTA URL send failed: {resp.text}")
+    return resp
+
+
+def send_terms_notice(sender, phone_id_val, lang):
+    """Terms notice with a button. If WhatsApp rejects the button, send the plain link."""
     text = TERMS_NOTICE_MAP.get(lang, TERMS_NOTICE_MAP["english"])
-    return f"{text}\n{CONSENT_FORM_URL}"
+    button = TERMS_BUTTON_MAP.get(lang, TERMS_BUTTON_MAP["english"])
+    try:
+        resp = send_cta_url(sender, text, button, CONSENT_FORM_URL, phone_id_val)
+        if resp.status_code < 400:
+            return
+    except Exception as e:
+        logging.error(f"CTA URL send error: {type(e).__name__}: {e}")
+    say(f"{text}\n{CONSENT_FORM_URL}", sender, phone_id_val)
 
 
 def send_welcome_with_id(sender, phone_id_val, lang, user_id):
@@ -1183,10 +1224,11 @@ def send_welcome_with_id(sender, phone_id_val, lang, user_id):
         f"Keep this ID safe because it'll be asked for at the Dawa clinics. How can I help you today?"
     )
     send(
-        f"{welcome}\n\n{terms_notice(lang)}",
+        welcome,
         sender, phone_id_val,
         save=False,   # fixed text, must not reach MedGemma through the history
     )
+    send_terms_notice(sender, phone_id_val, lang)
 
 
 GREET_MAP = {
